@@ -1409,6 +1409,14 @@ def _run_foreground(
 # (module imports, git probes under load) into a refusal; the wedge it bounds lasted an hour.
 _PRE_EXEC_GUARD_MIN_TIMEOUT_S = 30
 
+# Ceiling for the same share. A healthy guard chain renders its verdict in milliseconds; the
+# observed wedges burned 60-400s of a long command's deadline before failing closed, and every
+# one of them parked an abandoned guard thread in the same open(). The refusal is identical
+# either way, so cap the wait: a wedged probe is refused in 90s, not at whatever timeout the
+# caller's command happened to carry. Without this the refusal time tracks the command timeout
+# exactly, which is how 80% of logged refusals came out ABOVE 90s (#board-741).
+_PRE_EXEC_GUARD_MAX_TIMEOUT_S = 90
+
 
 def _pre_exec_block(
     command: str, *, env: Any, env_type: str, cwd: str,
@@ -1540,6 +1548,7 @@ def terminal_tool(
             # The guard chain runs on the deadline worker; keep it answerable to /stop
             # aimed at this tool thread (a remote-backend script read polls is_interrupted()).
             guard_timeout = max(plan.effective_timeout, _PRE_EXEC_GUARD_MIN_TIMEOUT_S)
+            guard_timeout = min(guard_timeout, _PRE_EXEC_GUARD_MAX_TIMEOUT_S)
             _acting_token = acting_for_tid.set(threading.current_thread().ident)
             try:
                 bounded_guard = run_bounded_sync(
