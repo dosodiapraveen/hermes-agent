@@ -208,8 +208,30 @@ def connect_tracked(
     opener = connect_fn if connect_fn is not None else sqlite3.connect
     kwargs["factory"] = _tracking_factory(kwargs.get("factory", sqlite3.Connection))
 
-    with _live_lock:
+    # BOUNDED, and that is load-bearing (#board-741/#board-834). ``opener()`` opens a real file:
+    # connect_tracked -> open() -> os_open() is where the live gateway's ONLY lock holder was
+    # sampled for 12 days. An unbounded acquire here means one connection on a slow/wedged path
+    # (a huge WAL to recover, a cloud placeholder, a TCC-gated directory) holds the process-wide
+    # lock for as long as it takes, and EVERY guard-facing waiter behind it -- the pre-exec guard
+    # reads the registry on every terminal call -- inherits that wedge for the life of the
+    # process. That is precisely the shape measured on 2026-11-21: ~1.4k parked guard workers,
+    # one holder in __open, and not a single bounded-lock warning, because the waiters were not
+    # the ones taking the lock.
+    #
+    # The budget is the module default, deliberately NOT ``kwargs["timeout"]``: that value is
+    # sqlite3's busy timeout for statements, a different wait with a different failure mode.
+    if not _acquire_live_lock():
+        raise LiveConnectionError(
+            f"Refusing to open a tracked connection to {path}: the connection-lifecycle lock has "
+            f"been held for {_LIVE_LOCK_TIMEOUT_S}s by another thread's file I/O (connect/open). "
+            "Blocking here would park every guard call in this process behind that I/O too, so "
+            "this open fails fast; retry once it completes.")
+    try:
         conn = opener(str(path), **kwargs)
+    except BaseException:
+        _live_lock.release()
+        raise
+    try:
         try:
             resolved = _key(tracking_path) if tracking_path is not None else _canonical_db_path(conn)
             if resolved is None:
@@ -242,6 +264,8 @@ def connect_tracked(
             except Exception:
                 pass
             raise
+    finally:
+        _live_lock.release()
 
 
 def _retrofit_tracking(conn: sqlite3.Connection, resolved: str) -> sqlite3.Connection:
