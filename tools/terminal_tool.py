@@ -1310,6 +1310,13 @@ def _run_foreground(
 # (module imports, git probes under load) into a refusal; the wedge it bounds lasted an hour.
 _PRE_EXEC_GUARD_MIN_TIMEOUT_S = 30
 
+# Ceiling for the same share. A healthy guard chain renders its verdict in milliseconds; the
+# observed wedges (#board-497) burned 60-400s of a long command's deadline before failing
+# closed, and every one of them parked an abandoned guard thread in the same open(). The
+# refusal is identical either way, so cap the wait: a wedged probe is refused in 90s, not
+# at whatever timeout the caller's command happened to carry.
+_PRE_EXEC_GUARD_MAX_TIMEOUT_S = 90
+
 
 def _pre_exec_block(
     command: str, *, env: Any, env_type: str, cwd: str,
@@ -1433,6 +1440,7 @@ def terminal_tool(
         # The guard chain runs on the deadline worker; keep it answerable to /stop
         # aimed at this tool thread (a remote-backend script read polls is_interrupted()).
         guard_timeout = max(plan.effective_timeout, _PRE_EXEC_GUARD_MIN_TIMEOUT_S)
+        guard_timeout = min(guard_timeout, _PRE_EXEC_GUARD_MAX_TIMEOUT_S)
         _acting_token = acting_for_tid.set(threading.current_thread().ident)
         try:
             bounded_guard = run_bounded_sync(
@@ -1445,9 +1453,20 @@ def terminal_tool(
         finally:
             acting_for_tid.reset(_acting_token)
         if bounded_guard.timed_out:
+            # Name the STAGE, not a suspect. This deadline wraps the whole of
+            # ``_pre_exec_block`` -- the gateway-lifecycle scan (which takes the
+            # SQLite connection-lifecycle lock for every script the command
+            # executes), the workdir validation, and the self-repo guard -- so no
+            # single subsystem can be blamed from here. It used to read
+            # "(process-identity probe wedged)", which named the one stage that
+            # measurement rules out: the identity chain renders in 0.28s on this
+            # host (psutil create_time 0.10s), while the real wedge was a raw
+            # reader parked under an unbounded lifecycle lock. That label sent
+            # five remediation passes at the wrong call site (board #741/#826).
             raise _Rejected(_error_json(
                 f"Terminal pre-execution guard did not finish within {guard_timeout}s "
-                "(process-identity probe wedged); the command was not run. Retry the call.",
+                "(no verdict from the pre-exec checks: gateway-lifecycle scan, workdir "
+                "validation, or self-repo guard); the command was not run. Retry the call.",
                 status="error",
             ))
         # Pre-exec security checks (floors + dangerous command detection);
