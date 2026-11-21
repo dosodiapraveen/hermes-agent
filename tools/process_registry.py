@@ -304,6 +304,15 @@ def _systemd_run_user_scope_available() -> bool:
         return available
 
 
+_SUPERVISED_GATEWAY_VERDICT: Optional[tuple[tuple[int, str, str], bool]] = None
+
+
+def _reset_supervised_gateway_verdict_cache() -> None:
+    """Forget the cached verdict (tests, and any caller that changed the process identity)."""
+    global _SUPERVISED_GATEWAY_VERDICT
+    _SUPERVISED_GATEWAY_VERDICT = None
+
+
 def _is_supervised_gateway_process() -> bool:
     """Whether this process is the live, supervised Hermes gateway itself.
     Supervisor markers and ``_HERMES_GATEWAY`` are inherited by every descendant (and
@@ -311,17 +320,52 @@ def _is_supervised_gateway_process() -> bool:
     gateway PID file — scopes are for the gateway, not terminal children or CLIs.
     Reads the launch marker (``HERMES_SUPERVISED_CHILD`` included), not the restart-route
     probe: a Windows Scheduled-Task gateway sets only that marker, and the self-kill guards
-    gated here must protect it too (#113667)."""
+    gated here must protect it too (#113667).
+
+    The verdict is invariant for one process with one environment, and the probe behind it
+    does real filesystem and kernel-process work: on macOS a single ``open()`` in that chain
+    can wedge, and the terminal guard calls this on EVERY command, so each abandoned guard
+    thread parked in the same open() (#board-497). Running a positive answer again bought
+    nothing, so it is memoized.
+
+    Only a CONFIRMED True is memoized, keyed on pid plus the two marker variables. A negative
+    answer is deliberately NOT cached: the gateway PID file is written after the process
+    starts and can briefly name the previous pid, so freezing an early False would answer
+    "not the gateway" for the rest of the process's life and silently disable the
+    self-kill/ownership guards (#113667). The negative path stays cheap -- the marker test
+    below returns before any probe for every non-gateway caller. A probe that raised is never
+    cached either.
+    """
+    global _SUPERVISED_GATEWAY_VERDICT
+
+    key = (
+        os.getpid(),
+        os.environ.get("_HERMES_GATEWAY", ""),
+        os.environ.get("HERMES_SUPERVISED_CHILD", ""),
+    )
+    cached = _SUPERVISED_GATEWAY_VERDICT
+    if cached is not None and cached[0] == key:
+        return cached[1]
+
     if os.environ.get("_HERMES_GATEWAY") != "1":
         return False
     try:
         from gateway.restart import is_supervised_gateway_launch
         from gateway.status import get_running_pid
 
-        return is_supervised_gateway_launch() and get_running_pid(cleanup_stale=False) == os.getpid()
+        verdict = is_supervised_gateway_launch() and get_running_pid(cleanup_stale=False) == os.getpid()
     except Exception as exc:
         logger.debug("Could not verify supervised gateway process identity: %s", exc)
         return False
+    # Only a CONFIRMED identity may be memoized. A probe that answered False is a transient
+    # read, not an invariant: the gateway PID file is written after the process starts and can
+    # still name the previous pid, so freezing that False would answer "not the gateway" for
+    # the rest of the process's life and silently disable the self-kill/ownership guards
+    # (#113667). The negative path stays cheap -- the marker test above short-circuits every
+    # non-gateway caller before any probe runs.
+    if verdict:
+        _SUPERVISED_GATEWAY_VERDICT = (key, True)
+    return verdict
 
 
 def _build_systemd_scope_argv(shell_argv: list[str], unit_suffix: str) -> list[str]:

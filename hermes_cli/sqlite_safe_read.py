@@ -11,8 +11,11 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import secrets
 import sqlite3
+import sys
 import threading
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +26,13 @@ logger = logging.getLogger(__name__)
 _live_lock = threading.RLock()
 # canonical path -> number of live connections opened by this process
 _live_connections: dict[str, int] = {}
+# Keys whose connection SQLite has closed, queued from wherever that happened (possibly inside a
+# garbage collection) and applied under _live_lock by the next registry read. Lock-free on purpose:
+# a collection can run while any lock is held, so it must never wait for _live_lock.
+_released: deque[str] = deque()
+# Private, randomised name so no caller overloads it by accident (that would free the release
+# object early, while the connection is still open).
+_RELEASE_FUNCTION = f"_hermes_release_{secrets.token_hex(8)}"
 
 
 class UntrackableConnectionError(RuntimeError):
@@ -76,11 +86,39 @@ def untrack_connection(path: Path | str) -> None:
         _track_key(_key(path), -1)
 
 
+def _apply_releases() -> None:
+    """Untrack every connection SQLite has finished closing (caller holds ``_live_lock``)."""
+    while _released:
+        _track_key(_released.popleft(), -1)
+
+
+class _ReleaseOnClose:
+    """Registered as a SQL function on each tracked connection, so SQLite holds the only reference.
+    SQLite frees a connection's functions after it has closed the database files (btrees first,
+    then the function table, in ``sqlite3LeaveMutexAndCloseZombie``; not an API promise, which
+    the tests pin), so this object is released only once the descriptors are gone: after ``close()``, or when pysqlite closes a
+    connection collected without it, on any thread (#149291). It only queues its key."""
+
+    __slots__ = ("armed", "key")
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        self.armed = False
+
+    def __call__(self) -> None:
+        return None
+
+    def __del__(self) -> None:
+        if self.armed and _released is not None:  # None only during interpreter teardown
+            _released.append(self.key)
+
+
 def _live_main_key(key: str) -> Optional[str]:
     """The tracked main-database key that makes *key* live, or ``None`` (caller holds ``_live_lock``).
 
     SQLite locks the main file and its WAL sidecars; a raw ``close()`` of any of those
     inodes cancels this process's POSIX locks, but the registry is keyed by the main path."""
+    _apply_releases()
     if key in _live_connections:
         return key
     for suffix in ("-wal", "-shm"):
@@ -89,13 +127,34 @@ def _live_main_key(key: str) -> Optional[str]:
     return None
 
 
-def has_live_connection(path: Path | str) -> bool:
+def has_live_connection(path: Path | str, *, timeout: Optional[float] = None) -> Optional[bool]:
     """Whether this process holds a connection to *path* (or to the database it is a sidecar of).
 
     Point-in-time answer: a raw open/close right after it returns ``False`` can still race a
-    new connection. Hold :func:`offline_file_access` across the I/O whenever possible."""
-    with _live_lock:
+    new connection. Hold :func:`offline_file_access` across the I/O whenever possible.
+
+    The registry read is bounded like every other acquire (``timeout``, default
+    :data:`_LIVE_LOCK_TIMEOUT_S`). The wait matters because the guard reads this to LABEL a
+    refusal, and an unbounded wait here re-bought the whole wedge after the bounded reader had
+    already failed fast (#board-741).
+
+    On expiry it answers ``True`` -- "assume a live connection", which is the fail-CLOSED
+    direction: every caller of this predicate refuses raw access when it is true, so a wedged
+    registry can only make a caller more cautious, never let it cancel another connection's
+    POSIX advisory locks (#board-827). It must never answer ``None`` or ``False`` here: ``None``
+    is falsy, so a caller writing ``if has_live_connection(p): refuse`` would proceed with the
+    raw read -- the exact fail-open the bound exists to prevent.
+    """
+    if not _acquire_live_lock(timeout):
+        logger.warning(
+            "cannot read the connection registry for %s: the connection-lifecycle lock has been "
+            "held for %ss (a wedged reader in another thread); assuming a live connection",
+            path, _LIVE_LOCK_TIMEOUT_S if timeout is None else timeout)
+        return True
+    try:
         return _live_main_key(_key(path)) is not None
+    finally:
+        _live_lock.release()
 
 
 class _TrackingMixin:
@@ -103,22 +162,17 @@ class _TrackingMixin:
 
     The real ``close()`` and the unregister happen together under ``_live_lock`` so a concurrent
     probe can never observe "no live connection" while this descriptor is still open. Unregister
-    runs only after ``close()`` succeeds: untracking before a failing close (e.g. cross-thread
-    ProgrammingError) would leave the FD open while the byte-probe guard thinks nothing is live.
+    runs only after the files are closed, through :class:`_ReleaseOnClose`: a failing close (e.g.
+    cross-thread ProgrammingError) keeps the entry while the FD stays open (#75629).
     """
 
     _hermes_tracked_path: str | None = None
 
     def close(self) -> None:  # type: ignore[misc]
         with _live_lock:
-            path = getattr(self, "_hermes_tracked_path", None)
-            # Close first; untrack only once the descriptor is actually gone. Untracking before a failing
-            # close (e.g. cross-thread ProgrammingError) leaves the FD open while the byte-probe guard
-            # thinks nothing is live — see #75629.
             super().close()  # type: ignore[misc]
-            if path is not None:
-                self._hermes_tracked_path = None
-                untrack_connection(path)
+            self._hermes_tracked_path = None
+            _apply_releases()
 
 
 class TrackedConnection(_TrackingMixin, sqlite3.Connection):
@@ -165,8 +219,20 @@ def connect_tracked(
                 # simulating FTS5-less runtimes do this). Retag the instance's class so close()
                 # still releases the registry entry rather than silently losing probe safety.
                 conn = _retrofit_tracking(conn, resolved)
-            conn._hermes_tracked_path = resolved
             _track_key(resolved)
+            release = _ReleaseOnClose(resolved)
+            try:
+                # Confirm registration without running SQL (a statement would read the schema and
+                # wait on locks): sqlite3 holds a reference to the callable while it is registered.
+                before = sys.getrefcount(release)
+                conn.create_function(_RELEASE_FUNCTION, 0, release)
+                if sys.getrefcount(release) == before:  # dropped: nothing would release the entry
+                    raise sqlite3.ProgrammingError("connection factory did not register the release function")
+            except Exception:
+                _track_key(resolved, -1)  # the release object can never fire: take the count back
+                raise
+            release.armed = True
+            conn._hermes_tracked_path = resolved
             return conn
         except Exception:
             try:
@@ -225,8 +291,22 @@ def read_header_bytes_preopen(path: Path | str, *, length: int = 100, force: boo
     """Read the first *length* bytes of *path* -- only when no connection is live. The ONLY
     sanctioned byte-level read of a database file, for first-open validation (real SQLite? zeroed?
     overwritten?). Check and open/read/close run together under ``_live_lock`` so a connection
-    cannot be opened between deciding "nothing is live" and closing this descriptor."""
-    with _live_lock:
+    cannot be opened between deciding "nothing is live" and closing this descriptor.
+
+    The wait for that lock is BOUNDED (:data:`_LIVE_LOCK_TIMEOUT_S`). This is the probe the
+    terminal pre-exec guard calls on every command, and the lock is held across another thread's
+    raw I/O, so an unbounded wait here inherits that thread's wedge and parks the guard. On expiry
+    this answers ``None`` -- the same fail-closed answer a live connection gets -- because "a raw
+    read is already in progress and will not finish" also means this read must not proceed
+    (#board-827).
+    """
+    if not _acquire_live_lock():
+        logger.warning(
+            "refusing byte-level read of %s: the connection-lifecycle lock has been held for %ss "
+            "(a raw read is wedged in another thread)",
+            path, _LIVE_LOCK_TIMEOUT_S)
+        return None
+    try:
         if not force and _live_main_key(_key(path)) is not None:
             logger.debug(
                 "refusing byte-level read of %s: a live connection exists in "
@@ -238,14 +318,61 @@ def read_header_bytes_preopen(path: Path | str, *, length: int = 100, force: boo
                 return handle.read(length)
         except OSError:
             return None
+    finally:
+        _live_lock.release()
+
+
+# A raw file read happens UNDER this lock, and every terminal guard call in the
+# process queues behind it. One caller whose read wedges (a cloud placeholder, a
+# TCC-gated path) therefore parked every later guard call for the life of the
+# process: 27 of 27 abandoned ``deadline-terminal.pre-exec-guard`` workers in
+# ``gateway.error.log`` sit at the ``_live_lock`` acquire below. A waiter now
+# fails CLOSED and FAST instead of inheriting the holder's wedge.
+#
+# EVERY wait on this lock is bounded, not just the raw-read one: the guard also
+# reads the registry to LABEL a refusal (``has_live_connection``), and an unbounded
+# wait there re-bought the whole wedge after the bounded reader had already failed
+# fast -- one acquire, 300s elapsed, on a 5s bound (#board-741).
+_LIVE_LOCK_TIMEOUT_S = 5.0
+
+
+def _acquire_live_lock(timeout: Optional[float] = None) -> bool:
+    """Try to take :data:`_live_lock` within a bounded budget; *timeout*=0 polls once.
+
+    ``None`` means the default. A negative budget is a deliberate unbounded wait (no
+    production caller passes one; kept so the bound is never silently unreachable).
+    """
+    budget = _LIVE_LOCK_TIMEOUT_S if timeout is None else timeout
+    if budget is None or budget < 0:
+        _live_lock.acquire()
+        return True
+    return _live_lock.acquire(timeout=budget)
 
 
 @contextlib.contextmanager
-def offline_file_access(path: Path | str, *, what: str = "read"):
+def offline_file_access(path: Path | str, *, what: str = "read", timeout: Optional[float] = None):
     """Hold the connection-lifecycle lock across a raw read of a database file: checking
     :func:`has_live_connection` and *then* doing raw I/O is a check/use race (a connection opened
-    in between loses its POSIX locks to the raw ``close()``). Held only for the raw I/O."""
-    with _live_lock:
+    in between loses its POSIX locks to the raw ``close()``). Held only for the raw I/O.
+
+    The wait for that lock is BOUNDED (``timeout``, default :data:`_LIVE_LOCK_TIMEOUT_S`): the
+    lock is held across caller I/O, so an unbounded wait lets one wedged reader stall every other
+    reader in the process. On expiry this raises :class:`LiveConnectionError` — the same
+    fail-closed answer a live connection gets — because "a raw read is already in progress and
+    will not finish" is exactly the state in which another raw read must not proceed.
+    """
+    budget = _LIVE_LOCK_TIMEOUT_S if timeout is None else timeout
+    acquired = _acquire_live_lock(timeout)
+    if not acquired:
+        logger.warning(
+            "refusing to %s %s: the connection-lifecycle lock has been held for %ss "
+            "(a raw read is wedged in another thread)", what, path, budget)
+        raise LiveConnectionError(
+            f"Refusing to {what} {path}: the connection-lifecycle lock is held by a raw read "
+            f"that has not finished in {budget}s, so this process cannot prove no live "
+            "connection would lose its POSIX advisory locks. Fail closed; retry after the "
+            "stuck read is abandoned.")
+    try:
         main = _live_main_key(_key(path))
         if main is not None:
             subject = "it" if main == _key(path) else f"its main database {main}"
@@ -255,3 +382,5 @@ def offline_file_access(path: Path | str, *, what: str = "read"):
                 "connection's POSIX advisory locks. Close all database "
                 "handles (stop the gateway/dashboard) and retry.")
         yield
+    finally:
+        _live_lock.release()

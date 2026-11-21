@@ -562,11 +562,28 @@ def _budget_exhausted(budget: _LifecycleScanBudget, what: str, depth: int) -> bo
 
 def _unreadable_reason(path: Path) -> str:
     """Name why an *executed* script failed closed without being scanned (live SQLite, device,
-    oversized). Message-only: the fail-closed verdict itself came from the bounded reader."""
-    from hermes_cli.sqlite_safe_read import has_live_connection
+    oversized, wedged reader). Message-only: the fail-closed verdict itself came from the bounded
+    reader.
 
-    if has_live_connection(path):
-        return f"`{path}` is a SQLite database open in this gateway process"
+    ``has_live_connection`` is a bounded read that answers ``True`` on expiry ("assume a live
+    connection" -- the fail-closed direction, #board-827). It therefore cannot distinguish "the
+    registry says this file is open" from "the registry lock was wedged so I could not tell", so
+    the wedged case is named by probing the lock's own budget rather than by a third return value
+    (a ``None`` third state made every ``if has_live_connection(p)`` caller fail OPEN, which is
+    exactly the bug #board-741 was chasing). Reporting this as "larger than the scan cap" sent
+    every reader of these logs chasing a size problem that was never there.
+    """
+    from hermes_cli import sqlite_safe_read
+
+    live = sqlite_safe_read.has_live_connection(path)
+    if live:
+        if sqlite_safe_read._acquire_live_lock(0):
+            sqlite_safe_read._live_lock.release()
+            return f"`{path}` is a SQLite database open in this gateway process"
+        return (
+            f"the script scan could not take the SQLite connection-lifecycle lock (another "
+            f"thread's raw read is wedged), so `{path}` was never opened"
+        )
     try:
         metadata = os.stat(path)
     except OSError:

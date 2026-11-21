@@ -362,11 +362,16 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     # warn-and-proceed: losing a forensic copy beats corrupting the live DB.
     from hermes_cli.sqlite_safe_read import has_live_connection
 
-    if has_live_connection(resolved):
+    live = has_live_connection(resolved)
+    if live:
+        # A live connection OR an unprovable registry ("assume live" on a wedged lock, #827) both
+        # fail CLOSED here — fingerprinting the file cancels this process's POSIX locks on it,
+        # which is the exact corruption this refuses.
         _kb._log.error(
             "refusing to quarantine %s: a connection to it is still open in "
-            "this process, and fingerprinting the file would cancel that "
-            "connection's POSIX locks. Close all connections first.",
+            "this process (or the connection-lifecycle lock is wedged so this "
+            "process cannot prove none is), and fingerprinting the file would "
+            "cancel that connection's POSIX locks. Close all connections first.",
             resolved,
         )
         return None
