@@ -754,9 +754,14 @@ def execute_code(
         _is_supervised_gateway_process, _probe_timeout, label="execute_code.lifecycle-guard",
     )
     if _probe.timed_out:
+        # Same rule as the terminal guard (#826): name the STAGE, not a suspect. This deadline
+        # wraps the whole lifecycle-verdict probe, and the probe that actually wedges is the
+        # gateway-lifecycle scan taking the SQLite connection-lifecycle lock -- not the
+        # process-identity chain, which renders in 0.28s on this host. The old
+        # "(process-identity probe wedged)" label sent five passes at the wrong call site.
         return tool_error(
             f"execute_code lifecycle guard did not finish within {_probe_timeout}s "
-            "(process-identity probe wedged); the code was not run. Retry the call."
+            "(no verdict from the gateway-lifecycle scan); the code was not run. Retry the call."
         )
     if _probe.value:
         from cron.lifecycle_guard import (
