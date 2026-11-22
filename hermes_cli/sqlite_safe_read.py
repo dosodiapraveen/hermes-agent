@@ -184,7 +184,21 @@ def connect_tracked(
     opener = connect_fn if connect_fn is not None else sqlite3.connect
     kwargs["factory"] = _tracking_factory(kwargs.get("factory", sqlite3.Connection))
 
-    with _live_lock:
+    # BOUNDED acquire, not `with _live_lock` (#board-741/#827). This is the one site that HOLDS
+    # the lock across real file I/O: `opener()` -> open() -> os_open(), and the first SQLite
+    # reads of a multi-GB state.db plus WAL recovery. While that open takes its time every
+    # terminal-guard call in the process queues behind it with no bound of its own -- measured
+    # 1,436 deadline workers parked here on the live gateway, while zero "lock has been held"
+    # warnings exist in any log, i.e. the bounded READERS never fired because they were never
+    # the problem. Binding the holder converts one slow open into a fast, retryable refusal
+    # instead of a process-wide stall.
+    acquired = _acquire_live_lock()
+    if not acquired:
+        raise LiveConnectionError(
+            f"timed out after {_LIVE_LOCK_TIMEOUT_S}s waiting to open {path} for tracking: "
+            "another connection open is holding the connection-lifecycle lock"
+        )
+    try:
         conn = opener(str(path), **kwargs)
         try:
             resolved = _key(tracking_path) if tracking_path is not None else _canonical_db_path(conn)
@@ -206,6 +220,10 @@ def connect_tracked(
             except Exception:
                 pass
             raise
+    finally:
+        # Released on EVERY path, including an opener that raises -- the manual acquire can
+        # leak what the old `with` could not, so the release lives in a finally and is tested.
+        _live_lock.release()
 
 
 def _retrofit_tracking(conn: sqlite3.Connection, resolved: str) -> sqlite3.Connection:
