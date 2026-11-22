@@ -80,11 +80,42 @@ def _verified_owner(control: Path, payload: dict) -> tuple[int, Any] | str:
         return "owner_unverified"
     current = get_process_start_time(pid)
     try:
-        if current is None or not start_time_fingerprints_match(recorded, current):
+        if current is None:
             return "owner_unverified"
+        if not start_time_fingerprints_match(recorded, current):
+            # A mismatched fingerprint is not automatically a recycled PID. The identify payload is
+            # built in the OWNER's process, and before the ``process_birth`` fix (#140580) that read
+            # was psutil's CLOCK-STEP-ADJUSTED ``create_time()``, whose adjustment is computed
+            # against ``INIT_BOOT_TIME`` frozen when the owner imported psutil. A long-lived owner
+            # that survived a clock step therefore reports a fingerprint nothing else computes:
+            # measured on this host, identify said 179421175530 while a fresh read AND the owner's
+            # own pid file both said 179421172730 — 2800 ticks apart against a 200-tick tolerance.
+            # That refused the OLDER-Hermes upgrade path (the exact case this module exists for)
+            # with ``owner_unverified``, and told the user to run the command the refusal blocks.
+            # The pid file is the independent witness: written by the owner at claim time, and it
+            # agrees with a fresh read whether or not the owner has since drifted.
+            witness = _owner_pid_file_start_time(control, pid)
+            if witness is None or not start_time_fingerprints_match(witness, current):
+                return "owner_unverified"
+            recorded = witness
     except (TypeError, ValueError):
         return "owner_unverified"
     return pid, current
+
+
+def _owner_pid_file_start_time(control: Path, pid: int) -> Any:
+    """``start_time`` the *pid* itself recorded in *control*'s pid file when it claimed the home.
+
+    The pid file is written by the owning process (``gateway.status._claim_pid_file``), so its
+    ``start_time`` is a same-host fingerprint of that same process taken at claim time — the one
+    reading a replacing client cannot fabricate from the identify payload it is trying to verify.
+    Returns None for an absent/unreadable file, a different PID, or a record with no start time.
+    """
+    from gateway.status import _pid_from_record, _read_pid_record
+    record = _read_pid_record(control / "gateway.pid")
+    if not isinstance(record, dict) or _pid_from_record(record) != pid:
+        return None
+    return record.get("start_time")
 
 
 def _write_planned_stop(control: Path, pid: int, start_time: Any) -> None:

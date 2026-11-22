@@ -8,6 +8,7 @@ A gateway of another install (a home that resolves outside this install's root) 
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -169,3 +170,57 @@ def test_replacement_never_targets_itself(home, monkeypatch):
     monkeypatch.setattr(replace, "_install_root", lambda: home)
     monkeypatch.setattr(replace, "_identify", lambda h, timeout: (home, _owner_payload(home, os.getpid(), 1)))
     assert replace.replace_incompatible_owner(home, deadline=time.monotonic() + 5) == "owner_unverified"
+
+
+# --- a clock-step-drifted owner fingerprint (board #892) -------------------------------------------
+#
+# An owner that predates ``process_birth`` (#140580) answers ``identify`` with psutil's clock-step-
+# ADJUSTED ``create_time()``, computed against an ``INIT_BOOT_TIME`` frozen when IT imported psutil.
+# A fresh read — and the owner's own pid file — report the clock-step-STABLE value instead, so the
+# two disagree by the size of the step. That is not a recycled PID, and refusing it disabled the
+# older-Hermes upgrade path this module exists for.
+
+def _write_pid_file(home: Path, pid: int, start_time) -> None:
+    (home / "gateway.pid").write_text(json.dumps({
+        "pid": pid, "kind": "hermes-gateway", "start_time": start_time,
+        "hermes_home": str(home)}), encoding="utf-8")
+
+
+@pytest.fixture
+def drifted_owner(home, monkeypatch):
+    """A live process whose identify fingerprint is the value a PRE-#140580 Hermes would report."""
+    import subprocess
+    import sys
+    from gateway.status import START_TIME_DRIFT_TOLERANCE, get_process_start_time
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    fresh = get_process_start_time(proc.pid)
+    # 28 s: the drift measured on the Mac after an NTP step, i.e. ~14x the liveness tolerance.
+    stale = fresh - (START_TIME_DRIFT_TOLERANCE * 14)
+    monkeypatch.setattr(replace, "_install_root", lambda: home)
+    monkeypatch.setattr(replace, "_identify", lambda h, timeout: (home, _owner_payload(home, proc.pid, stale)))
+    yield proc, fresh, stale
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
+
+
+def test_a_drifted_owner_fingerprint_is_confirmed_by_its_own_pid_file(home, drifted_owner):
+    """The pid file the owner wrote at claim time is the independent witness: it agrees with a
+    fresh read, so a drifted identify payload no longer blocks the upgrade."""
+    proc, fresh, stale = drifted_owner
+    _write_pid_file(home, proc.pid, fresh)
+    assert replace._verified_owner(home, _owner_payload(home, proc.pid, stale)) == (proc.pid, fresh)
+
+
+def test_a_drifted_fingerprint_with_no_pid_file_witness_is_still_refused(home, drifted_owner):
+    """No witness, no proof. A recycled PID whose identify reading disagrees with the live one
+    must still be refused — the fallback narrows, it does not remove, the guard."""
+    proc, fresh, stale = drifted_owner
+    assert replace._verified_owner(home, _owner_payload(home, proc.pid, stale)) == "owner_unverified"
+
+
+def test_a_pid_file_naming_another_pid_is_not_a_witness(home, drifted_owner):
+    """A stale pid file must not vouch for a recycled PID: the witness has to name the same pid."""
+    proc, fresh, stale = drifted_owner
+    _write_pid_file(home, proc.pid + 1, fresh)
+    assert replace._verified_owner(home, _owner_payload(home, proc.pid, stale)) == "owner_unverified"
